@@ -50,7 +50,13 @@ const DEFAULT_CONFIG: PiPurgeConfig = {
   continueText: "继续",
 };
 
-const DATA_DIR = path.join(os.homedir(), ".pi", "agent", "pi-purge");
+// Respect PI_CODING_AGENT_DIR the way Pi itself does. Hard-coding ~/.pi/agent
+// made the extension untestable and would write to the wrong place for anyone
+// running Pi with a custom agent dir.
+const AGENT_DIR = process.env.PI_CODING_AGENT_DIR?.trim()
+  ? path.resolve(process.env.PI_CODING_AGENT_DIR.trim())
+  : path.join(os.homedir(), ".pi", "agent");
+const DATA_DIR = path.join(AGENT_DIR, "pi-purge");
 const CONFIG_FILE = path.join(DATA_DIR, "config.json");
 const INJECT_FILE = path.join(DATA_DIR, "prompt-inject.md");
 const PRESETS_DIR = path.join(DATA_DIR, "presets");
@@ -85,7 +91,58 @@ function loadConfig(): PiPurgeConfig {
 
 function saveConfig(cfg: PiPurgeConfig): void {
   ensureDataDir();
-  fs.writeFileSync(CONFIG_FILE, `${JSON.stringify(cfg, null, 2)}\n`, "utf8");
+  writeAtomic(CONFIG_FILE, `${JSON.stringify(cfg, null, 2)}\n`);
+}
+
+/* ------------------------------------------------------------ 内容写入与备份 */
+
+/**
+ * Write through a temp file and swap, so an interrupted write cannot truncate the
+ * injected prompt into a half sentence. UTF-8 without BOM -- a BOM would show up as
+ * three invisible bytes at the head of the injected text.
+ */
+function writeAtomic(file: string, text: string): void {
+  ensureDataDir();
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, text, "utf8");
+  fs.renameSync(tmp, file);
+}
+
+const BACKUP_DIR = path.join(DATA_DIR, "backup");
+
+/**
+ * Snapshot a content file before overwriting it. The first snapshot is kept as
+ * `<name>.orig` so `/purge set restore` always has the pre-edit version, and every
+ * write also leaves a timestamped copy so nothing is silently lost.
+ */
+function backupBeforeWrite(file: string): { orig: string | null; snap: string | null } {
+  if (!fs.existsSync(file)) return { orig: null, snap: null };
+  fs.mkdirSync(BACKUP_DIR, { recursive: true });
+  const base = path.basename(file, path.extname(file));
+  const ext = path.extname(file);
+
+  let orig: string | null = null;
+  const origPath = path.join(BACKUP_DIR, `${base}.orig${ext}`);
+  if (!fs.existsSync(origPath)) {
+    fs.copyFileSync(file, origPath);
+    orig = origPath;
+  }
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "-").slice(0, 19);
+  let snap: string | null = path.join(BACKUP_DIR, `${base}.${stamp}${ext}`);
+  let n = 1;
+  while (fs.existsSync(snap)) snap = path.join(BACKUP_DIR, `${base}.${stamp}-${n++}${ext}`);
+  fs.copyFileSync(file, snap);
+  return { orig, snap };
+}
+
+/** Resolve a user-supplied path: ~ expansion, then relative to cwd. */
+function resolveUserPath(input: string, cwd: string): string {
+  let p = input.trim();
+  if (p === "~") p = os.homedir();
+  else if (p.startsWith("~/") || p.startsWith("~\\")) p = path.join(os.homedir(), p.slice(2));
+  if (!path.isAbsolute(p)) p = path.resolve(cwd, p);
+  return p;
 }
 
 function clampInt(value: unknown, fallback: number, min: number, max: number): number {
@@ -241,7 +298,183 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // ---------------------------------------------------------- /purge 命令
+  /**
+   * `/purge set ...` -- replace the injected text from inside Pi, without leaving
+   * the session.
+   *
+   *   set text <文字>                 replace with inline text (short prompts)
+   *   set file <路径>                 replace with a file's contents
+   *   set append <文字>               append a line (keeps what is there)
+   *   set clear                       empty it
+   *   set restore                     restore the pre-set original
+   *   set backups                     list snapshots
+   *   set edit                        open the file in the OS editor
+   *
+   * Long prompts do not belong on a command line: `set file` and `set edit` exist
+   * for those. Every write snapshots the previous content first.
+   */
+  async function handleSet(args: string[], ctx: any, modelKey: string): Promise<void> {
+    const action = (args[0] ?? "").toLowerCase();
+    const rest = args.slice(1);
+
+    const usage = [
+      "用法:",
+      "  /purge set text <文字>      用这段文字替换",
+      "  /purge set file <路径>      用文件内容替换",
+      "  /purge set append <文字>    追加一段（保留原有）",
+      "  /purge set clear            清空",
+      "  /purge set restore          恢复设定前的原始内容",
+      "  /purge set backups          列出备份",
+      "  /purge set edit             用系统编辑器打开",
+      "",
+      "长提示词请用 set file 或 set edit —— 命令行长文本会被 shell 截断。",
+    ].join("\n");
+
+    const target = INJECT_FILE;
+
+    if (action === "" || action === "help") {
+      ctx.ui.notify(`当前主注入: ${readText(target).length} 字符\n\n${usage}`, "info");
+      return;
+    }
+
+    if (action === "text") {
+      const text = rest.join(" ");
+      if (!text.trim()) {
+        ctx.ui.notify(`set text 需要一个参数。\n\n${usage}`, "warning");
+        return;
+      }
+      const bak = backupBeforeWrite(target);
+      writeAtomic(target, text);
+      reportWrite(ctx, text, bak);
+      return;
+    }
+
+    if (action === "file") {
+      const input = rest[0];
+      if (!input) {
+        ctx.ui.notify(`set file 需要一个路径。\n\n${usage}`, "warning");
+        return;
+      }
+      const resolved = resolveUserPath(input, ctx.cwd ?? process.cwd());
+      if (!fs.existsSync(resolved)) {
+        ctx.ui.notify(`文件不存在: ${resolved}`, "error");
+        return;
+      }
+      let text: string;
+      try {
+        text = fs.readFileSync(resolved, "utf8");
+      } catch (err) {
+        ctx.ui.notify(`读取失败: ${(err as Error).message}`, "error");
+        return;
+      }
+      if (!text.trim()) {
+        ctx.ui.notify(`文件是空的，没有写入: ${resolved}`, "warning");
+        return;
+      }
+      const bak = backupBeforeWrite(target);
+      // Strip a BOM if the source had one -- it would otherwise ride along as
+      // invisible bytes at the head of the injected text.
+      writeAtomic(target, text.replace(/^\uFEFF/, ""));
+      reportWrite(ctx, text, bak, resolved);
+      return;
+    }
+
+    if (action === "append") {
+      const text = rest.join(" ");
+      if (!text.trim()) {
+        ctx.ui.notify(`set append 需要一个参数。\n\n${usage}`, "warning");
+        return;
+      }
+      const current = readText(target);
+      const sep = current === "" || current.endsWith("\n") ? "" : "\n";
+      const next = `${current}${sep}${text}\n`;
+      const bak = backupBeforeWrite(target);
+      writeAtomic(target, next);
+      reportWrite(ctx, next, bak);
+      return;
+    }
+
+    if (action === "clear") {
+      const bak = backupBeforeWrite(target);
+      writeAtomic(target, "");
+      ctx.ui.notify(
+        bak.snap ? `已清空。原内容备份在: ${bak.snap}` : "已清空（原本就是空的）。",
+        "info",
+      );
+      return;
+    }
+
+    if (action === "restore") {
+      const orig = path.join(BACKUP_DIR, "prompt-inject.orig.md");
+      if (!fs.existsSync(orig)) {
+        ctx.ui.notify(`没有找到设定前的原始备份:\n${orig}`, "warning");
+        return;
+      }
+      const text = readText(orig);
+      backupBeforeWrite(target);
+      writeAtomic(target, text);
+      ctx.ui.notify(`已恢复 ${text.length} 字符。下一轮生效。`, "info");
+      return;
+    }
+
+    if (action === "backups") {
+      if (!fs.existsSync(BACKUP_DIR)) {
+        ctx.ui.notify("暂无备份。", "info");
+        return;
+      }
+      const files = fs
+        .readdirSync(BACKUP_DIR)
+        .filter((n) => n.startsWith("prompt-inject.") && n.endsWith(".md"))
+        .sort()
+        .reverse()
+        .slice(0, 20);
+      if (files.length === 0) {
+        ctx.ui.notify("暂无备份。", "info");
+        return;
+      }
+      const lines = files.map((n) => {
+        const st = fs.statSync(path.join(BACKUP_DIR, n));
+        const size = st.size.toLocaleString("en-US");
+        return `${n}  ${size} 字节`;
+      });
+      ctx.ui.notify(`备份目录: ${BACKUP_DIR}\n\n${lines.join("\n")}`, "info");
+      return;
+    }
+
+    if (action === "edit") {
+      const { spawn } = await import("node:child_process");
+      try {
+        if (process.platform === "win32") {
+          spawn("cmd", ["/c", "start", "", target], { detached: true, stdio: "ignore" }).unref();
+        } else if (process.platform === "darwin") {
+          spawn("open", ["-t", target], { detached: true, stdio: "ignore" }).unref();
+        } else {
+          spawn("xdg-open", [target], { detached: true, stdio: "ignore" }).unref();
+        }
+        ctx.ui.notify(
+          `已打开编辑器:\n${target}\n\n保存后回来敲 /purge preview 确认，本轮结束自动重读。`,
+          "info",
+        );
+      } catch (err) {
+        ctx.ui.notify(`打开编辑器失败: ${(err as Error).message}\n直接编辑: ${target}`, "error");
+      }
+      return;
+    }
+
+    ctx.ui.notify(`未知的 set 动作: ${action}\n\n${usage}`, "warning");
+  }
+
+  function reportWrite(ctx: any, text: string, bak: { orig: string | null; snap: string | null }, source?: string): void {
+    const lines = [
+      `已写入 ${text.length} 字符${source ? `（来自 ${source}）` : ""}。`,
+      bak.orig ? `原始备份: ${bak.orig}` : "",
+      bak.snap ? `本次快照: ${bak.snap}` : "",
+      "",
+      "下一轮生效，无需重启。",
+      "确认内容: /purge preview",
+    ].filter(Boolean);
+    ctx.ui.notify(lines.join("\n"), "info");
+  }
   pi.registerCommand("purge", {
     description: "pi-purge：提示词注入、preset 与自动续跑控制",
     handler: async (args, ctx) => {
@@ -378,6 +611,11 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      if (sub === "set") {
+        await handleSet(argv.slice(1), ctx, modelKey);
+        return;
+      }
+
       ctx.ui.notify(
         [
           "/purge status            状态与本轮注入量",
@@ -387,6 +625,7 @@ export default function (pi: ExtensionAPI) {
           "/purge preset [名字]     查看/指定 preset（auto 取消）",
           "/purge position prepend|append",
           "/purge continue on|off|max N|text 文案",
+          "/purge set               查看 set 用法",
         ].join("\n"),
         "warning",
       );
