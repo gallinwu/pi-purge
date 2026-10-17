@@ -94,6 +94,83 @@ check("set restore brings back the original",
   fs.readFileSync(target, "utf8") === "OLD CONTENT",
   fs.readFileSync(target, "utf8"));
 
+// ── 6b. undo: step back one edit ───────────────────────────────────────────
+// Each write snapshots what preceded it, so: set V1 leaves a snapshot of the
+// current file, set V2 leaves one of V1, set V3 leaves one of V2. Undo must land
+// on V2 -- the state immediately before the last write.
+fs.writeFileSync(target, "V1", "utf8");
+await run("set text V1");   // snapshot: "V1" (from the write above)
+await run("set text V2");   // snapshot: "V1"
+await run("set text V3");   // snapshot: "V2"
+check("content is V3 before undo", fs.readFileSync(target, "utf8") === "V3");
+await run("set undo");
+check("undo steps back to V2", fs.readFileSync(target, "utf8") === "V2", fs.readFileSync(target, "utf8"));
+await run("set undo");
+check("undo again steps back to V1", fs.readFileSync(target, "utf8") === "V1", fs.readFileSync(target, "utf8"));
+
+// ── 6c. undo consumes the stack rather than bouncing ───────────────────────
+// Undo pops a snapshot, so repeated undo walks backwards through history instead
+// of alternating between two states.
+const undoStack = () => {
+  const bd = path.join(dataDir, "backup");
+  if (!fs.existsSync(bd)) return 0;
+  return fs.readdirSync(bd).filter(
+    (n) => /^prompt-inject\.\d{4}-.*\.md$/.test(n) && !n.includes(".undone-") && n !== "prompt-inject.orig.md",
+  ).length;
+};
+
+fs.writeFileSync(target, "STACK-BASE", "utf8");
+await run("set text S1");
+await run("set text S2");
+await run("set text S3");
+const depthBefore = undoStack();
+check("each edit adds a snapshot", depthBefore >= 3, `depth=${depthBefore}`);
+
+await run("set undo");
+const u1 = fs.readFileSync(target, "utf8");
+await run("set undo");
+const u2 = fs.readFileSync(target, "utf8");
+
+check("undo walks backwards", u1 !== u2, `u1=${JSON.stringify(u1)} u2=${JSON.stringify(u2)}`);
+check("undo never resurrects the newest state", u1 !== "S3" && u2 !== "S3", `${u1}/${u2}`);
+check("undo consumes the stack", undoStack() < depthBefore, `before=${depthBefore} after=${undoStack()}`);
+
+// The state an undo walks away from is preserved, not destroyed.
+const backupFiles = fs.readdirSync(path.join(dataDir, "backup"));
+check("the state an undo leaves behind is kept on disk",
+  backupFiles.some((n) => n.includes(".undone-")),
+  backupFiles.join(", "));
+
+// ── 6d. rollback with no argument lists snapshots ──────────────────────────
+out = await run("set rollback");
+check("bare rollback lists snapshots", /可用快照/.test(out), out);
+
+// ── 6e. rollback by index ──────────────────────────────────────────────────
+fs.writeFileSync(target, "INDEX-TARGET", "utf8");
+await run("set text SNAP-A");
+await run("set text SNAP-B");
+const listing = await run("set backups");
+const idxOfA = listing
+  .split("\n")
+  .find((l) => l.includes("SNAP") || /^\d+\./.test(l.trim()) && l.includes(".md"));
+// Roll back to the oldest snapshot index via the printed list.
+out = await run("set rollback 1");
+check("rollback by index reports the snapshot", /已回滚到/.test(out), out);
+
+// ── 6f. rollback by name fragment ──────────────────────────────────────────
+const snapsOut = await run("set backups");
+const firstName = (snapsOut.match(/\d+\.\s+(\S+\.md)/) ?? [])[1];
+if (firstName) {
+  out = await run(`set rollback ${firstName.replace(".md", "")}`);
+  check("rollback by name fragment works", /已回滚到/.test(out), out);
+} else {
+  check("rollback by name fragment works (skipped: no name parsed)", false, snapsOut.slice(0, 200));
+}
+
+// ── 6g. rollback to a nonexistent snapshot is refused ──────────────────────
+out = await run("set rollback does-not-exist-xyz");
+check("unknown snapshot is refused", /没有找到快照/.test(out), out);
+
 // ── 7. set backups ─────────────────────────────────────────────────────────
 out = await run("set backups");
 check("set backups lists snapshots", out.includes("prompt-inject."), out);

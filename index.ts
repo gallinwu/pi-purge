@@ -145,6 +145,54 @@ function resolveUserPath(input: string, cwd: string): string {
   return p;
 }
 
+interface Snapshot {
+  name: string;
+  path: string;
+  size: number;
+  mtime: number;
+  /** Timestamp part of the name, sortable as a string. */
+  stamp: string;
+  /** Disambiguator for same-second writes; 0 when absent. */
+  n: number;
+}
+
+/**
+ * Snapshots newest first.
+ *
+ * The name carries a second-precision stamp plus an optional `-N` disambiguator
+ * for several edits in one second. Ordering must key on BOTH: the stamp as a
+ * string (it is already sortable) and N numerically (so `-10` > `-2`, which
+ * lexically it is not). mtime cannot be used -- it is identical to the
+ * millisecond for edits written in the same second.
+ */
+function listSnapshots(): Snapshot[] {
+  if (!fs.existsSync(BACKUP_DIR)) return [];
+  const re = /^prompt-inject\.(\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2})(?:-(\d+))?\.md$/;
+  const parsed: Snapshot[] = [];
+  for (const n of fs.readdirSync(BACKUP_DIR)) {
+    if (!n.startsWith("prompt-inject.") || !n.endsWith(".md")) continue;
+    if (n === "prompt-inject.orig.md") continue;
+    if (n.includes(".undone-")) continue; // retired states: reachable via rollback name
+    const m = re.exec(n);
+    if (!m) continue;
+    const p = path.join(BACKUP_DIR, n);
+    const st = fs.statSync(p);
+    parsed.push({
+      name: n,
+      path: p,
+      size: st.size,
+      mtime: st.mtimeMs,
+      stamp: m[1],
+      n: m[2] ? Number(m[2]) : 0,
+    });
+  }
+  parsed.sort((a, b) => {
+    if (a.stamp !== b.stamp) return a.stamp < b.stamp ? 1 : -1;
+    return b.n - a.n;
+  });
+  return parsed;
+}
+
 function clampInt(value: unknown, fallback: number, min: number, max: number): number {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
@@ -307,6 +355,8 @@ export default function (pi: ExtensionAPI) {
    *   set append <文字>               append a line (keeps what is there)
    *   set clear                       empty it
    *   set restore                     restore the pre-set original
+   *   set undo                        step back one edit
+   *   set rollback <n|name>           go back to a specific snapshot
    *   set backups                     list snapshots
    *   set edit                        open the file in the OS editor
    *
@@ -323,7 +373,9 @@ export default function (pi: ExtensionAPI) {
       "  /purge set file <路径>      用文件内容替换",
       "  /purge set append <文字>    追加一段（保留原有）",
       "  /purge set clear            清空",
-      "  /purge set restore          恢复设定前的原始内容",
+      "  /purge set restore          回到最初版本",
+      "  /purge set undo             回滚上一次改动",
+      "  /purge set rollback <序号>   回到指定快照（不带参数看列表）",
       "  /purge set backups          列出备份",
       "  /purge set edit             用系统编辑器打开",
       "",
@@ -413,31 +465,113 @@ export default function (pi: ExtensionAPI) {
       const text = readText(orig);
       backupBeforeWrite(target);
       writeAtomic(target, text);
-      ctx.ui.notify(`已恢复 ${text.length} 字符。下一轮生效。`, "info");
+      ctx.ui.notify(`已恢复到最初版本 ${text.length} 字符。下一轮生效。`, "info");
+      return;
+    }
+
+    // ── undo: step back one edit ──
+    if (action === "undo") {
+      const stack = listSnapshots();
+      if (stack.length === 0) {
+        ctx.ui.notify("没有可回滚的快照。", "warning");
+        return;
+      }
+
+      // Undo POPS: restore the newest snapshot, then retire it. Without the pop,
+      // the snapshot this undo creates would be the newest one next time and undo
+      // would bounce between the same two states forever.
+      const top = stack[0];
+      const text = readText(top.path);
+
+      // Preserve the state we are leaving under a name the undo stack ignores, so
+      // nothing is lost and `set rollback` can still reach it.
+      if (fs.existsSync(target)) {
+        fs.mkdirSync(BACKUP_DIR, { recursive: true });
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "-").slice(0, 19);
+        let side = path.join(BACKUP_DIR, `prompt-inject.undone-${stamp}.md`);
+        let k = 1;
+        while (fs.existsSync(side)) side = path.join(BACKUP_DIR, `prompt-inject.undone-${stamp}-${k++}.md`);
+        fs.copyFileSync(target, side);
+      }
+
+      writeAtomic(target, text);
+      try {
+        fs.unlinkSync(top.path);
+      } catch {
+        // Retiring the snapshot is best effort; the restore already succeeded.
+      }
+
+      const remaining = listSnapshots().length;
+      ctx.ui.notify(
+        `已回滚上一版（${text.length} 字符）。\n` +
+          `来源快照已消耗，还可回滚 ${remaining} 步。\n` +
+          `下一轮生效。`,
+        "info",
+      );
+      return;
+    }
+
+    // ── rollback [n | 名称]: go back to a specific snapshot ──
+    if (action === "rollback") {
+      const snaps = listSnapshots();
+      if (snaps.length === 0) {
+        ctx.ui.notify("没有可回滚的快照。", "warning");
+        return;
+      }
+
+      const arg = rest[0];
+      if (!arg) {
+        const preview = snaps.slice(0, 10).map((s, i) => `  ${i + 1}. ${s.name}  ${s.size} 字节`);
+        ctx.ui.notify(
+          `用法: /purge set rollback <序号|名称>\n\n可用快照（新 -> 旧）:\n${preview.join("\n")}\n\n` +
+            `共 ${snaps.length} 个。/purge set undo 可直接回滚上一步。`,
+          "info",
+        );
+        return;
+      }
+
+      // Accept either a 1-based index or a substring of the filename.
+      let chosen = null;
+      const idx = Number(arg);
+      if (Number.isInteger(idx) && idx >= 1 && idx <= snaps.length) {
+        chosen = snaps[idx - 1];
+      } else {
+        const matches = snaps.filter((s) => s.name.includes(arg));
+        if (matches.length === 1) chosen = matches[0];
+        else if (matches.length > 1) {
+          ctx.ui.notify(
+            `「${arg}」匹配到 ${matches.length} 个快照，请更具体：\n` +
+              matches.slice(0, 10).map((s) => `  ${s.name}`).join("\n"),
+            "warning",
+          );
+          return;
+        }
+      }
+      if (!chosen) {
+        ctx.ui.notify(`没有找到快照: ${arg}\n用 /purge set backups 查看可用的。`, "error");
+        return;
+      }
+
+      const text = readText(chosen.path);
+      const bak = backupBeforeWrite(target);
+      writeAtomic(target, text);
+      ctx.ui.notify(
+        `已回滚到 ${chosen.name}\n${text.length} 字符。\n` +
+          (bak.snap ? `回滚前的内容已另存: ${bak.snap}\n` : "") +
+          `下一轮生效。`,
+        "info",
+      );
       return;
     }
 
     if (action === "backups") {
-      if (!fs.existsSync(BACKUP_DIR)) {
+      const snaps = listSnapshots();
+      if (snaps.length === 0) {
         ctx.ui.notify("暂无备份。", "info");
         return;
       }
-      const files = fs
-        .readdirSync(BACKUP_DIR)
-        .filter((n) => n.startsWith("prompt-inject.") && n.endsWith(".md"))
-        .sort()
-        .reverse()
-        .slice(0, 20);
-      if (files.length === 0) {
-        ctx.ui.notify("暂无备份。", "info");
-        return;
-      }
-      const lines = files.map((n) => {
-        const st = fs.statSync(path.join(BACKUP_DIR, n));
-        const size = st.size.toLocaleString("en-US");
-        return `${n}  ${size} 字节`;
-      });
-      ctx.ui.notify(`备份目录: ${BACKUP_DIR}\n\n${lines.join("\n")}`, "info");
+      const lines = snaps.slice(0, 20).map((s, i) => `${i + 1}. ${s.name}  ${s.size.toLocaleString("en-US")} 字节`);
+      ctx.ui.notify(`备份目录: ${BACKUP_DIR}\n\n${lines.join("\n")}\n\n回滚: /purge set undo 或 /purge set rollback <序号>`, "info");
       return;
     }
 
