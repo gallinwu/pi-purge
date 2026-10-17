@@ -1,0 +1,28 @@
+{
+  "name": "pi-purge",
+  "version": "0.1.0",
+  "description": "Prompt-injection extension for Pi: inject text into Pi's own system prompt, per-model presets, and auto-continue on truncation.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "index.ts",
+    "editor",
+    "tools",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types smoke.test.ts",
+    "build:editor": "powershell -ExecutionPolicy Bypass -File ./tools/build-editor.ps1 -Force"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
