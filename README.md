@@ -50,10 +50,24 @@
 /purge set file D:\人格.txt           用文件内容替换（长提示词用这个）
 /purge set append 补充一条规则         追加，保留原有内容
 /purge set clear                      清空
-/purge set restore                    恢复成设定前的原始内容
+/purge set restore                    回到最初版本
+/purge set undo                       回滚上一次改动
+/purge set rollback <序号|名称>        回到指定快照（不带参数看列表）
 /purge set backups                    列出所有历史快照
 /purge set edit                       用系统编辑器打开，改完回来即可
 ```
+
+### 回滚
+
+三种粒度：
+
+- **`set undo`** —— 退一步。它是**消耗式**的：回滚到上一版后那个快照就被用掉了，
+  所以连着敲会一路往回走（V3 → V2 → V1），而不是在两个状态之间来回跳。
+  被退掉的那个状态会另存为 `backup/prompt-inject.undone-<时间>.md`，不会丢。
+- **`set rollback <序号>`** —— 跳到任意一个快照，序号就是 `set backups` 里列的数字。
+- **`set restore`** —— 回到第一次使用 `set` 之前的那份原始内容。
+
+`set backups` 按新旧排序，回滚前先看一眼列表最稳。
 
 每次写入前都会自动快照到 `~/.pi/agent/pi-purge/backup/`：第一次留下
 `prompt-inject.orig.md`（`set restore` 用的就是它），之后每次带时间戳另存一份，
