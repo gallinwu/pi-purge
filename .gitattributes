@@ -1,0 +1,5 @@
+# Keep script files byte-exact: encoding mistakes break these silently.
+*.ps1 -text
+*.cmd -text
+*.bat -text
+*.txt -text
