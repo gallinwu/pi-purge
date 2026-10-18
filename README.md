@@ -12,10 +12,35 @@
 
 ## 安装
 
-已装到 `~/.pi/agent/extensions/pi-purge/index.ts`（Pi 自动发现子目录的 `index.ts`）。
-改完源码后在 Pi 里敲 `/reload` 热重载，或重启 Pi。
+在 Pi 里直接装，一条命令：
 
-源码在 `dswork/pi-purge/`，安装副本是它的拷贝——改动记得两边同步。
+```
+pi install git:github.com/gallinwu/pi-purge
+```
+
+或者打开 **Pi Agent Desktop → 设置 → 插件**，在「来源」里填同样的地址：
+
+```
+git:github.com/gallinwu/pi-purge
+```
+
+装完重启 Pi，敲 `/purge status` 确认。以后更新用 `pi update`。
+
+> **不要同时保留手动副本。** 如果你之前手动把 `index.ts` 拷到
+> `~/.pi/agent/extensions/pi-purge/`，请先删掉再走插件安装——两处注册同名扩展会让
+> **两份都加载失败**（报 `Tool ... conflicts with`）。
+>
+> ```powershell
+> Remove-Item -Recurse -Force "$env:USERPROFILE\.pi\agent\extensions\pi-purge"
+> ```
+
+不想装也可以临时试用：
+
+```
+pi --extension /path/to/pi-purge
+```
+
+装好后的数据目录是 `~/.pi/agent/pi-purge/`（`PI_CODING_AGENT_DIR` 设了就跟着变）。
 
 ## 文件
 
