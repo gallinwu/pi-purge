@@ -7,11 +7,7 @@
     "noEmit": true,
     "skipLibCheck": true,
     "allowImportingTsExtensions": true,
-    "typeRoots": ["./node_modules/@types"],
-    "paths": {
-      "@earendil-works/pi-coding-agent": ["C:/Users/gaill/AppData/Roaming/npm/node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"]
-    },
-    "baseUrl": "."
+    "typeRoots": ["./node_modules/@types"]
   },
   "include": ["index.ts"]
 }
